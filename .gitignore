@@ -1,0 +1,14 @@
+data/
+output/
+predictions/
+test_log/
+*.pth
+*.pt
+*.ckpt
+*.npz
+*.npy.h5
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+.ipynb_checkpoints/
