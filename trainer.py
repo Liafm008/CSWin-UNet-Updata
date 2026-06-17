@@ -40,6 +40,8 @@ def trainer_synapse(args, model, snapshot_path):
     device = args.device
     base_lr = args.base_lr
     num_classes = args.num_classes
+    dice_weight = getattr(args, "dice_weight", 0.4)
+    ce_weight = getattr(args, "ce_weight", 0.6)
     effective_gpu_count = max(1, args.n_gpu)
     batch_size = args.batch_size * effective_gpu_count
 
@@ -118,7 +120,7 @@ def trainer_synapse(args, model, snapshot_path):
                 outputs = model(image_batch)
                 loss_ce = ce_loss(outputs, label_batch.long())
                 loss_dice = dice_loss(outputs, label_batch, softmax=True)
-                loss = 0.4 * loss_ce + 0.6 * loss_dice
+                loss = dice_weight * loss_dice + ce_weight * loss_ce
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)

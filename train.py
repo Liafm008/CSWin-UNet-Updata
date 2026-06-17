@@ -103,6 +103,18 @@ parser.add_argument(
     action="store_true",
     help="disable TF32 matmul/cudnn acceleration on Ampere+ GPUs",
 )
+parser.add_argument(
+    "--dice_weight",
+    type=float,
+    default=0.4,
+    help="weight for Dice loss; paper uses 0.4",
+)
+parser.add_argument(
+    "--ce_weight",
+    type=float,
+    default=0.6,
+    help="weight for cross-entropy loss; paper uses 0.6",
+)
 
 
 def main():
