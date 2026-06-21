@@ -115,6 +115,31 @@ parser.add_argument(
     default=0.6,
     help="weight for cross-entropy loss; paper uses 0.6",
 )
+parser.add_argument(
+    "--skip_fusion",
+    type=str,
+    default="none",
+    choices=["none", "attention", "sdi", "sdi_add"],
+    help="skip connection refinement: none, attention, SDI, or additive SDI",
+)
+parser.add_argument(
+    "--sdi_channels",
+    type=int,
+    default=32,
+    help="intermediate channels used by SDI skip fusion",
+)
+parser.add_argument(
+    "--skip_fusion_scale",
+    type=float,
+    default=0.1,
+    help="initial residual scale for skip fusion refinement",
+)
+parser.add_argument(
+    "--max_train_batches",
+    type=int,
+    default=None,
+    help="debug only: stop training after this many batches",
+)
 
 
 def main():

@@ -130,6 +130,36 @@ parser.add_argument(
     action="store_true",
     help="skip THOP FLOPs/params profiling after inference",
 )
+parser.add_argument(
+    "--skip_fusion",
+    type=str,
+    default="none",
+    choices=["none", "attention", "sdi", "sdi_add"],
+    help="skip connection refinement used by the trained checkpoint",
+)
+parser.add_argument(
+    "--sdi_channels",
+    type=int,
+    default=32,
+    help="intermediate channels used by SDI skip fusion",
+)
+parser.add_argument(
+    "--skip_fusion_scale",
+    type=float,
+    default=0.1,
+    help="initial residual scale for skip fusion refinement",
+)
+parser.add_argument(
+    "--postprocess_lcc",
+    action="store_true",
+    help="keep the largest connected component for each foreground class",
+)
+parser.add_argument(
+    "--postprocess_min_size",
+    type=int,
+    default=0,
+    help="remove connected components smaller than this voxel count",
+)
 
 
 def inference(args, model, test_save_path=None):
@@ -164,6 +194,8 @@ def inference(args, model, test_save_path=None):
             z_spacing=args.z_spacing,
             device=args.device,
             use_amp=args.use_amp,
+            postprocess_lcc=args.postprocess_lcc,
+            postprocess_min_size=args.postprocess_min_size,
         )
         metric_list += np.array(metric_i)
         logging.info(

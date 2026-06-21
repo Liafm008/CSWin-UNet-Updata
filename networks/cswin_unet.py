@@ -322,6 +322,169 @@ class CARAFE4(nn.Module):
         return x
 
 
+def _tokens_to_feature_map(x):
+    B, new_HW, C = x.shape
+    H = W = int(np.sqrt(new_HW))
+    if H * W != new_HW:
+        raise ValueError("feature tokens must describe a square feature map")
+    return x.transpose(-2, -1).contiguous().view(B, C, H, W)
+
+
+def _feature_map_to_tokens(x):
+    B, C = x.shape[:2]
+    return x.contiguous().view(B, C, -1).transpose(-2, -1).contiguous()
+
+
+class SkipAttentionBlock(nn.Module):
+    """CBAM-style spatial and channel attention for one skip feature."""
+
+    def __init__(self, dim, reduction=16):
+        super().__init__()
+        hidden_dim = max(dim // reduction, 4)
+        self.spatial = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
+            nn.Sigmoid(),
+        )
+        self.channel_mlp = nn.Sequential(
+            nn.Conv2d(dim, hidden_dim, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, dim, kernel_size=1, bias=False),
+        )
+        self.channel_gate = nn.Sigmoid()
+
+    def forward_map(self, x):
+        avg_map = torch.mean(x, dim=1, keepdim=True)
+        max_map = torch.amax(x, dim=1, keepdim=True)
+        x = x * self.spatial(torch.cat([avg_map, max_map], dim=1))
+
+        avg_pool = F.adaptive_avg_pool2d(x, 1)
+        max_pool = F.adaptive_max_pool2d(x, 1)
+        channel_weight = self.channel_gate(
+            self.channel_mlp(avg_pool) + self.channel_mlp(max_pool)
+        )
+        return x * channel_weight
+
+    def forward(self, x):
+        return _feature_map_to_tokens(self.forward_map(_tokens_to_feature_map(x)))
+
+
+class SkipAttentionFusion(nn.Module):
+    def __init__(self, dims, init_scale=0.5):
+        super().__init__()
+        self.blocks = nn.ModuleList([SkipAttentionBlock(dim) for dim in dims])
+        self.scales = nn.Parameter(torch.full((len(dims),), float(init_scale)))
+
+    def forward(self, features):
+        refined = []
+        for i, feature in enumerate(features[:len(self.blocks)]):
+            attended = self.blocks[i](feature)
+            scale = self.scales[i].to(device=feature.device, dtype=feature.dtype)
+            refined.append(feature + scale * (attended - feature))
+        return tuple(refined)
+
+
+class SmoothConv(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(1, channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class SDIFusion(nn.Module):
+    """Semantics and Detail Infusion for CSWin-UNet skip features."""
+
+    def __init__(
+        self,
+        dims,
+        inter_channels=32,
+        target_levels=3,
+        init_scale=0.1,
+        fusion_mode="product",
+        use_attention=True,
+    ):
+        super().__init__()
+        self.target_levels = target_levels
+        self.fusion_mode = fusion_mode
+        self.use_attention = use_attention
+        self.attentions = (
+            nn.ModuleList([SkipAttentionBlock(dim) for dim in dims])
+            if use_attention
+            else None
+        )
+        self.reductions = nn.ModuleList(
+            [nn.Conv2d(dim, inter_channels, kernel_size=1) for dim in dims]
+        )
+        self.smooth = nn.ModuleList(
+            [
+                nn.ModuleList([SmoothConv(inter_channels) for _ in dims])
+                for _ in range(target_levels)
+            ]
+        )
+        self.fuse_norms = nn.ModuleList(
+            [nn.GroupNorm(1, inter_channels) for _ in range(target_levels)]
+        )
+        self.projections = nn.ModuleList(
+            [
+                nn.Conv2d(inter_channels, dims[i], kernel_size=1)
+                for i in range(target_levels)
+            ]
+        )
+        self.scales = nn.Parameter(torch.full((target_levels,), float(init_scale)))
+
+    def forward(self, features):
+        feature_maps = []
+        for idx, (feature, reduction) in enumerate(zip(features, self.reductions)):
+            feature_map = _tokens_to_feature_map(feature)
+            if self.use_attention:
+                feature_map = self.attentions[idx].forward_map(feature_map)
+            feature_maps.append(reduction(feature_map))
+
+        refined = []
+        for target_idx in range(self.target_levels):
+            target_size = feature_maps[target_idx].shape[-2:]
+            resized_features = []
+            for source_idx, feature_map in enumerate(feature_maps):
+                if feature_map.shape[-2:] == target_size:
+                    resized = feature_map
+                elif feature_map.shape[-2] > target_size[0]:
+                    resized = F.adaptive_avg_pool2d(feature_map, target_size)
+                else:
+                    resized = F.interpolate(
+                        feature_map,
+                        size=target_size,
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                resized_features.append(self.smooth[target_idx][source_idx](resized))
+
+            fused = resized_features[0]
+            if self.fusion_mode == "product":
+                for resized in resized_features[1:]:
+                    fused = fused * resized
+            elif self.fusion_mode == "add":
+                for resized in resized_features[1:]:
+                    fused = fused + resized
+                fused = fused / len(resized_features)
+            else:
+                raise ValueError("Unsupported SDI fusion mode: {}".format(self.fusion_mode))
+            fused = self.fuse_norms[target_idx](fused)
+            delta = self.projections[target_idx](fused)
+            delta = _feature_map_to_tokens(delta)
+
+            feature = features[target_idx]
+            scale = self.scales[target_idx].to(
+                device=feature.device, dtype=feature.dtype
+            )
+            refined.append(feature + scale * delta)
+        return tuple(refined)
+
+
 class CSWinTransformer(nn.Module):
     """ Vision Transformer with support for patch or hybrid CNN input stage
     """
@@ -329,12 +492,14 @@ class CSWinTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=8, embed_dim=64, depth=[1, 2, 9, 1],
                  split_size=[1, 2, 7, 7],
                  num_heads=12, mlp_ratio=4., qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0, hybrid_backbone=None, norm_layer=nn.LayerNorm, use_chk=False):
+                 drop_path_rate=0, hybrid_backbone=None, norm_layer=nn.LayerNorm, use_chk=False,
+                 skip_fusion="none", sdi_channels=32, skip_fusion_scale=0.1):
         super().__init__()
         self.use_chk = use_chk
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         heads = num_heads
+        self.skip_fusion_type = skip_fusion
 
         #encoder
 
@@ -388,6 +553,32 @@ class CSWinTransformer(nn.Module):
                 for i in range(depth[-1])])
 
         self.norm = norm_layer(curr_dim)
+
+        skip_dims = [embed_dim, embed_dim * 2, embed_dim * 4, embed_dim * 8]
+        if skip_fusion == "none":
+            self.skip_fusion = None
+        elif skip_fusion == "attention":
+            self.skip_fusion = SkipAttentionFusion(
+                skip_dims[:3], init_scale=skip_fusion_scale
+            )
+        elif skip_fusion == "sdi":
+            self.skip_fusion = SDIFusion(
+                skip_dims,
+                inter_channels=sdi_channels,
+                target_levels=3,
+                init_scale=skip_fusion_scale,
+            )
+        elif skip_fusion == "sdi_add":
+            self.skip_fusion = SDIFusion(
+                skip_dims,
+                inter_channels=sdi_channels,
+                target_levels=3,
+                init_scale=skip_fusion_scale,
+                fusion_mode="add",
+                use_attention=False,
+            )
+        else:
+            raise ValueError("Unsupported skip_fusion: {}".format(skip_fusion))
 
         # decoder
 
@@ -500,6 +691,12 @@ class CSWinTransformer(nn.Module):
                 x = blk(x)
 
         x = self.norm(x)
+        self.x4 = x
+
+        if self.skip_fusion is not None:
+            self.x1, self.x2, self.x3 = self.skip_fusion(
+                (self.x1, self.x2, self.x3, self.x4)
+            )
 
         return x
 
@@ -557,7 +754,4 @@ class CSWinTransformer(nn.Module):
 
 
         return x
-
-
-
 

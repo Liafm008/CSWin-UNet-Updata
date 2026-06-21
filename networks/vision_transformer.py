@@ -34,7 +34,10 @@ class CSwinUnet(nn.Module):
                                 qk_scale=config.MODEL.CSWIN.QK_SCALE,
                                 drop_rate=config.MODEL.DROP_RATE,
                                 drop_path_rate=config.MODEL.DROP_PATH_RATE,
-                                use_chk=config.TRAIN.USE_CHECKPOINT)
+                                use_chk=config.TRAIN.USE_CHECKPOINT,
+                                skip_fusion=config.MODEL.CSWIN.SKIP_FUSION,
+                                sdi_channels=config.MODEL.CSWIN.SDI_CHANNELS,
+                                skip_fusion_scale=config.MODEL.CSWIN.SKIP_FUSION_SCALE)
 
     def forward(self, x):
         if x.size()[1] == 1:

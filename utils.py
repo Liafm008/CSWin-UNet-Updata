@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from medpy import metric
+from scipy import ndimage
 from scipy.ndimage import zoom
 import torch.nn as nn
 import SimpleITK as sitk
@@ -59,7 +60,61 @@ def calculate_metric_percase(pred, gt):
         return 0, 0
 
 
-def test_single_volume(image, label, net, classes, patch_size=[256, 256], test_save_path=None, case=None, z_spacing=1, device=None, use_amp=False):
+def keep_largest_connected_component(mask):
+    if mask.sum() == 0:
+        return mask
+    structure = np.ones((3,) * mask.ndim, dtype=np.uint8)
+    labeled, num_components = ndimage.label(mask, structure=structure)
+    if num_components <= 1:
+        return mask
+    component_sizes = np.bincount(labeled.ravel())
+    component_sizes[0] = 0
+    return labeled == component_sizes.argmax()
+
+
+def remove_small_connected_components(mask, min_size):
+    if min_size <= 0 or mask.sum() == 0:
+        return mask
+    structure = np.ones((3,) * mask.ndim, dtype=np.uint8)
+    labeled, num_components = ndimage.label(mask, structure=structure)
+    if num_components == 0:
+        return mask
+    component_sizes = np.bincount(labeled.ravel())
+    keep_labels = np.where(component_sizes >= min_size)[0]
+    keep_labels = keep_labels[keep_labels != 0]
+    if len(keep_labels) == 0:
+        return mask
+    return np.isin(labeled, keep_labels)
+
+
+def postprocess_prediction(prediction, classes, keep_largest=False, min_size=0):
+    if not keep_largest and min_size <= 0:
+        return prediction
+    processed = np.zeros_like(prediction)
+    for class_id in range(1, classes):
+        class_mask = prediction == class_id
+        if keep_largest:
+            class_mask = keep_largest_connected_component(class_mask)
+        if min_size > 0:
+            class_mask = remove_small_connected_components(class_mask, min_size)
+        processed[class_mask] = class_id
+    return processed
+
+
+def test_single_volume(
+    image,
+    label,
+    net,
+    classes,
+    patch_size=[256, 256],
+    test_save_path=None,
+    case=None,
+    z_spacing=1,
+    device=None,
+    use_amp=False,
+    postprocess_lcc=False,
+    postprocess_min_size=0,
+):
     if device is None:
         device = next(net.parameters()).device
     image, label = image.squeeze(0).cpu().detach().numpy(), label.squeeze(0).cpu().detach().numpy()
@@ -90,6 +145,12 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256], test_s
             with get_autocast(device, enabled=use_amp):
                 out = torch.argmax(torch.softmax(net(input), dim=1), dim=1).squeeze(0)
             prediction = out.cpu().detach().numpy()
+    prediction = postprocess_prediction(
+        prediction,
+        classes,
+        keep_largest=postprocess_lcc,
+        min_size=postprocess_min_size,
+    )
     metric_list = []
     for i in range(1, classes):
         metric_list.append(calculate_metric_percase(prediction == i, label == i))

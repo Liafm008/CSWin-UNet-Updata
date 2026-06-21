@@ -140,6 +140,23 @@ def trainer_synapse(args, model, snapshot_path):
                 % (iter_num, loss.item(), loss_ce.item())
             )
 
+            max_train_batches = getattr(args, "max_train_batches", None)
+            if max_train_batches is not None and iter_num >= max_train_batches:
+                debug_model_path = os.path.join(snapshot_path, "debug_model.pth")
+                save_checkpoint(
+                    debug_model_path,
+                    model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch_num,
+                    iter_num=iter_num,
+                    best_performance=best_performance,
+                )
+                logging.info("debug stop after %d batches", iter_num)
+                logging.info("save model to {}".format(debug_model_path))
+                writer.close()
+                return "Debug Training Finished!"
+
             if iter_num % 20 == 0 and image_batch.size(0) > 0:
                 sample_index = min(1, image_batch.size(0) - 1)
                 image = image_batch[sample_index, 0:1, :, :]

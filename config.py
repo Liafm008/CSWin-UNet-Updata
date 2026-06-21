@@ -66,6 +66,9 @@ _C.MODEL.CSWIN.QKV_BIAS = True
 _C.MODEL.CSWIN.QK_SCALE = None
 _C.MODEL.CSWIN.APE = False
 _C.MODEL.CSWIN.PATCH_NORM = True
+_C.MODEL.CSWIN.SKIP_FUSION = 'none'
+_C.MODEL.CSWIN.SDI_CHANNELS = 32
+_C.MODEL.CSWIN.SKIP_FUSION_SCALE = 0.1
 
 
 
@@ -213,6 +216,12 @@ def update_config(config, args):
 
     if hasattr(args, "img_size") and args.img_size:
         config.DATA.IMG_SIZE = args.img_size
+    if hasattr(args, "skip_fusion") and args.skip_fusion:
+        config.MODEL.CSWIN.SKIP_FUSION = args.skip_fusion
+    if hasattr(args, "sdi_channels") and args.sdi_channels:
+        config.MODEL.CSWIN.SDI_CHANNELS = args.sdi_channels
+    if hasattr(args, "skip_fusion_scale") and args.skip_fusion_scale is not None:
+        config.MODEL.CSWIN.SKIP_FUSION_SCALE = args.skip_fusion_scale
 
     config.freeze()
 
