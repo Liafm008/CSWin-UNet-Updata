@@ -119,8 +119,19 @@ parser.add_argument(
     "--skip_fusion",
     type=str,
     default="none",
-    choices=["none", "attention", "sdi", "sdi_add"],
-    help="skip connection refinement: none, attention, SDI, or additive SDI",
+    choices=[
+        "none",
+        "attention",
+        "decoder_gate",
+        "sab_cab",
+        "dca",
+        "sdi",
+        "sdi_mid",
+        "sdi_resprod",
+        "sdi_gate",
+        "sdi_add",
+    ],
+    help="skip connection refinement: none, attention, decoder-guided gate, SAB/CAB, DCA, SDI, mid-level SDI, residual-product SDI, gated SDI, or additive SDI",
 )
 parser.add_argument(
     "--sdi_channels",

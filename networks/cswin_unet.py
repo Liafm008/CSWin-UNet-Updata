@@ -383,6 +383,224 @@ class SkipAttentionFusion(nn.Module):
         return tuple(refined)
 
 
+class DecoderGuidedSkipGate(nn.Module):
+    """Use decoder semantics to modulate an encoder skip before concatenation."""
+
+    def __init__(self, skip_dim, decoder_dim, inter_dim=None, init_scale=0.1):
+        super().__init__()
+        inter_dim = inter_dim or max(skip_dim // 4, 16)
+        self.skip_proj = nn.Conv2d(skip_dim, inter_dim, kernel_size=1, bias=False)
+        self.decoder_proj = nn.Conv2d(
+            decoder_dim, inter_dim, kernel_size=1, bias=False
+        )
+        self.norm = nn.GroupNorm(1, inter_dim)
+        self.act = nn.GELU()
+        self.gate = nn.Conv2d(inter_dim, 1, kernel_size=1)
+        self.scale = nn.Parameter(torch.tensor(float(init_scale)))
+
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+
+    def forward(self, skip, decoder):
+        skip_map = _tokens_to_feature_map(skip)
+        decoder_map = _tokens_to_feature_map(decoder)
+        if decoder_map.shape[-2:] != skip_map.shape[-2:]:
+            decoder_map = F.interpolate(
+                decoder_map,
+                size=skip_map.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        gate = self.skip_proj(skip_map) + self.decoder_proj(decoder_map)
+        gate = torch.sigmoid(self.gate(self.act(self.norm(gate))))
+        scale = self.scale.to(device=skip_map.device, dtype=skip_map.dtype)
+        modulation = 1.0 + scale * (2.0 * gate - 1.0)
+        return _feature_map_to_tokens(skip_map * modulation)
+
+
+class ASPChannelAttentionBlock(nn.Module):
+    """Residual channel attention inspired by ASP-VMUNet CAB."""
+
+    def __init__(self, dim, kernel_size=3):
+        super().__init__()
+        padding = (kernel_size - 1) // 2
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        attn = self.avg_pool(x).squeeze(-1).transpose(-1, -2)
+        attn = self.conv(attn).transpose(-1, -2).unsqueeze(-1)
+        attn = self.sigmoid(attn)
+        return x * attn + x
+
+
+class ASPSpatialAttentionBlock(nn.Module):
+    """Residual spatial attention inspired by ASP-VMUNet SAB."""
+
+    def __init__(self, kernel_size=7, dilation=3):
+        super().__init__()
+        padding = dilation * (kernel_size - 1) // 2
+        self.conv = nn.Conv2d(
+            2,
+            1,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation,
+            bias=False,
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_map = torch.mean(x, dim=1, keepdim=True)
+        max_map = torch.amax(x, dim=1, keepdim=True)
+        attn = self.sigmoid(self.conv(torch.cat([avg_map, max_map], dim=1)))
+        return x * attn + x
+
+
+class SABCabBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.cab = ASPChannelAttentionBlock(dim)
+        self.sab = ASPSpatialAttentionBlock()
+
+    def forward(self, x):
+        return self.sab(self.cab(x))
+
+
+class SABCabFusion(nn.Module):
+    def __init__(self, dims, init_scale=0.1):
+        super().__init__()
+        self.blocks = nn.ModuleList([SABCabBlock(dim) for dim in dims])
+        self.scales = nn.Parameter(torch.full((len(dims),), float(init_scale)))
+
+    def forward(self, features):
+        refined = []
+        for i, feature in enumerate(features[:len(self.blocks)]):
+            feature_map = _tokens_to_feature_map(feature)
+            attended = _feature_map_to_tokens(self.blocks[i](feature_map))
+            scale = self.scales[i].to(device=feature.device, dtype=feature.dtype)
+            refined.append(feature + scale * (attended - feature))
+        return tuple(refined)
+
+
+class DepthwiseTokenProjection(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.proj = nn.Conv1d(dim, dim, kernel_size=1, groups=dim, bias=False)
+
+    def forward(self, x):
+        return self.proj(x.transpose(1, 2)).transpose(1, 2).contiguous()
+
+
+class ChannelCrossAttention(nn.Module):
+    def __init__(self, dims):
+        super().__init__()
+        total_dim = sum(dims)
+        self.norms = nn.ModuleList([nn.LayerNorm(dim) for dim in dims])
+        self.q_projs = nn.ModuleList([DepthwiseTokenProjection(dim) for dim in dims])
+        self.out_projs = nn.ModuleList([DepthwiseTokenProjection(dim) for dim in dims])
+        self.k_proj = DepthwiseTokenProjection(total_dim)
+        self.v_proj = DepthwiseTokenProjection(total_dim)
+
+    def forward(self, tokens):
+        norm_tokens = [norm(token) for norm, token in zip(self.norms, tokens)]
+        context = torch.cat(norm_tokens, dim=-1)
+        key = self.k_proj(context).transpose(1, 2)
+        value = self.v_proj(context).transpose(1, 2)
+        scale = tokens[0].shape[1] ** -0.5
+
+        outputs = []
+        for token, query_proj, out_proj in zip(norm_tokens, self.q_projs, self.out_projs):
+            query = query_proj(token).transpose(1, 2)
+            attn = torch.softmax(query @ key.transpose(-2, -1) * scale, dim=-1)
+            out = (attn @ value).transpose(1, 2).contiguous()
+            outputs.append(out_proj(out))
+        return outputs
+
+
+class SpatialCrossAttention(nn.Module):
+    def __init__(self, dims, num_heads=4):
+        super().__init__()
+        total_dim = sum(dims)
+        if total_dim % num_heads != 0:
+            raise ValueError("total DCA channels must be divisible by num_heads")
+        self.num_heads = num_heads
+        self.norms = nn.ModuleList([nn.LayerNorm(dim) for dim in dims])
+        self.q_proj = DepthwiseTokenProjection(total_dim)
+        self.k_proj = DepthwiseTokenProjection(total_dim)
+        self.v_projs = nn.ModuleList([DepthwiseTokenProjection(dim) for dim in dims])
+        self.out_projs = nn.ModuleList([DepthwiseTokenProjection(dim) for dim in dims])
+
+    def _split_heads(self, x):
+        B, P, C = x.shape
+        head_dim = C // self.num_heads
+        return x.view(B, P, self.num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+
+    def forward(self, tokens):
+        norm_tokens = [norm(token) for norm, token in zip(self.norms, tokens)]
+        context = torch.cat(norm_tokens, dim=-1)
+        query = self._split_heads(self.q_proj(context))
+        key = self._split_heads(self.k_proj(context))
+        scale = query.shape[-1] ** -0.5
+        attn = torch.softmax(query @ key.transpose(-2, -1) * scale, dim=-1)
+
+        outputs = []
+        for token, value_proj, out_proj in zip(norm_tokens, self.v_projs, self.out_projs):
+            value = value_proj(token)
+            B, P, C = value.shape
+            value = value.unsqueeze(1).expand(B, self.num_heads, P, C)
+            out = (attn @ value).mean(dim=1)
+            outputs.append(out_proj(out))
+        return outputs
+
+
+class DCAFusion(nn.Module):
+    """Dual Cross-Attention bridge for CSWin-UNet skip features."""
+
+    def __init__(self, dims, init_scale=0.1, num_heads=4):
+        super().__init__()
+        self.cca = ChannelCrossAttention(dims)
+        self.sca = SpatialCrossAttention(dims, num_heads=num_heads)
+        self.norms = nn.ModuleList([nn.LayerNorm(dim) for dim in dims])
+        self.act = nn.GELU()
+        self.scales = nn.Parameter(torch.full((len(dims),), float(init_scale)))
+
+    def forward(self, features):
+        feature_maps = [_tokens_to_feature_map(feature) for feature in features[:3]]
+        target_size = feature_maps[-1].shape[-2:]
+
+        pooled_tokens = []
+        for feature_map in feature_maps:
+            if feature_map.shape[-2:] == target_size:
+                pooled = feature_map
+            else:
+                pooled = F.adaptive_avg_pool2d(feature_map, target_size)
+            pooled_tokens.append(_feature_map_to_tokens(pooled))
+
+        tokens = self.cca(pooled_tokens)
+        tokens = self.sca(tokens)
+
+        refined = []
+        for i, (feature, feature_map, token) in enumerate(
+            zip(features[:3], feature_maps, tokens)
+        ):
+            token = self.act(self.norms[i](token))
+            dca_map = _tokens_to_feature_map(token)
+            if dca_map.shape[-2:] != feature_map.shape[-2:]:
+                dca_map = F.interpolate(
+                    dca_map,
+                    size=feature_map.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            dca_tokens = _feature_map_to_tokens(dca_map)
+            scale = self.scales[i].to(device=feature.device, dtype=feature.dtype)
+            refined.append(feature + scale * (dca_tokens - feature))
+        return tuple(refined)
+
+
 class SmoothConv(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -407,11 +625,23 @@ class SDIFusion(nn.Module):
         init_scale=0.1,
         fusion_mode="product",
         use_attention=True,
+        use_gate=False,
+        target_indices=None,
     ):
         super().__init__()
-        self.target_levels = target_levels
+        if target_indices is None:
+            target_indices = list(range(target_levels))
+        self.target_indices = list(target_indices)
+        if not self.target_indices:
+            raise ValueError("SDIFusion needs at least one target index")
+        if min(self.target_indices) < 0 or max(self.target_indices) >= target_levels:
+            raise ValueError(
+                "SDIFusion target indices must be in the decoder skip range"
+            )
+        self.target_levels = len(self.target_indices)
         self.fusion_mode = fusion_mode
         self.use_attention = use_attention
+        self.use_gate = use_gate
         self.attentions = (
             nn.ModuleList([SkipAttentionBlock(dim) for dim in dims])
             if use_attention
@@ -423,30 +653,48 @@ class SDIFusion(nn.Module):
         self.smooth = nn.ModuleList(
             [
                 nn.ModuleList([SmoothConv(inter_channels) for _ in dims])
-                for _ in range(target_levels)
+                for _ in range(self.target_levels)
             ]
         )
         self.fuse_norms = nn.ModuleList(
-            [nn.GroupNorm(1, inter_channels) for _ in range(target_levels)]
+            [nn.GroupNorm(1, inter_channels) for _ in range(self.target_levels)]
         )
         self.projections = nn.ModuleList(
             [
-                nn.Conv2d(inter_channels, dims[i], kernel_size=1)
-                for i in range(target_levels)
+                nn.Conv2d(inter_channels, dims[target_idx], kernel_size=1)
+                for target_idx in self.target_indices
             ]
         )
-        self.scales = nn.Parameter(torch.full((target_levels,), float(init_scale)))
+        self.gates = (
+            nn.ModuleList(
+                [
+                    nn.Conv2d(dims[target_idx], dims[target_idx], kernel_size=1)
+                    for target_idx in self.target_indices
+                ]
+            )
+            if use_gate
+            else None
+        )
+        if self.gates is not None:
+            for gate in self.gates:
+                nn.init.zeros_(gate.weight)
+                nn.init.constant_(gate.bias, -2.0)
+        self.scales = nn.Parameter(
+            torch.full((self.target_levels,), float(init_scale))
+        )
 
     def forward(self, features):
+        original_maps = []
         feature_maps = []
         for idx, (feature, reduction) in enumerate(zip(features, self.reductions)):
             feature_map = _tokens_to_feature_map(feature)
+            original_maps.append(feature_map)
             if self.use_attention:
                 feature_map = self.attentions[idx].forward_map(feature_map)
             feature_maps.append(reduction(feature_map))
 
-        refined = []
-        for target_idx in range(self.target_levels):
+        refined = list(features[:3])
+        for level_idx, target_idx in enumerate(self.target_indices):
             target_size = feature_maps[target_idx].shape[-2:]
             resized_features = []
             for source_idx, feature_map in enumerate(feature_maps):
@@ -461,27 +709,36 @@ class SDIFusion(nn.Module):
                         mode="bilinear",
                         align_corners=False,
                     )
-                resized_features.append(self.smooth[target_idx][source_idx](resized))
+                resized_features.append(self.smooth[level_idx][source_idx](resized))
 
             fused = resized_features[0]
             if self.fusion_mode == "product":
                 for resized in resized_features[1:]:
                     fused = fused * resized
+            elif self.fusion_mode == "resprod":
+                fused = resized_features[target_idx]
+                for source_idx, resized in enumerate(resized_features):
+                    if source_idx == target_idx:
+                        continue
+                    fused = fused * (1.0 + torch.tanh(resized))
             elif self.fusion_mode == "add":
                 for resized in resized_features[1:]:
                     fused = fused + resized
                 fused = fused / len(resized_features)
             else:
                 raise ValueError("Unsupported SDI fusion mode: {}".format(self.fusion_mode))
-            fused = self.fuse_norms[target_idx](fused)
-            delta = self.projections[target_idx](fused)
+            fused = self.fuse_norms[level_idx](fused)
+            delta = self.projections[level_idx](fused)
+            if self.use_gate:
+                gate = torch.sigmoid(self.gates[level_idx](original_maps[target_idx]))
+                delta = delta * gate
             delta = _feature_map_to_tokens(delta)
 
             feature = features[target_idx]
-            scale = self.scales[target_idx].to(
+            scale = self.scales[level_idx].to(
                 device=feature.device, dtype=feature.dtype
             )
-            refined.append(feature + scale * delta)
+            refined[target_idx] = feature + scale * delta
         return tuple(refined)
 
 
@@ -555,10 +812,34 @@ class CSWinTransformer(nn.Module):
         self.norm = norm_layer(curr_dim)
 
         skip_dims = [embed_dim, embed_dim * 2, embed_dim * 4, embed_dim * 8]
+        self.decoder_skip_gates = None
         if skip_fusion == "none":
             self.skip_fusion = None
+        elif skip_fusion == "decoder_gate":
+            self.skip_fusion = None
+            self.decoder_skip_gates = nn.ModuleList(
+                [
+                    DecoderGuidedSkipGate(
+                        skip_dims[2], skip_dims[2], init_scale=skip_fusion_scale
+                    ),
+                    DecoderGuidedSkipGate(
+                        skip_dims[1], skip_dims[1], init_scale=skip_fusion_scale
+                    ),
+                    DecoderGuidedSkipGate(
+                        skip_dims[0], skip_dims[0], init_scale=skip_fusion_scale
+                    ),
+                ]
+            )
         elif skip_fusion == "attention":
             self.skip_fusion = SkipAttentionFusion(
+                skip_dims[:3], init_scale=skip_fusion_scale
+            )
+        elif skip_fusion == "sab_cab":
+            self.skip_fusion = SABCabFusion(
+                skip_dims[:3], init_scale=skip_fusion_scale
+            )
+        elif skip_fusion == "dca":
+            self.skip_fusion = DCAFusion(
                 skip_dims[:3], init_scale=skip_fusion_scale
             )
         elif skip_fusion == "sdi":
@@ -567,6 +848,30 @@ class CSWinTransformer(nn.Module):
                 inter_channels=sdi_channels,
                 target_levels=3,
                 init_scale=skip_fusion_scale,
+            )
+        elif skip_fusion == "sdi_mid":
+            self.skip_fusion = SDIFusion(
+                skip_dims,
+                inter_channels=sdi_channels,
+                target_levels=3,
+                init_scale=skip_fusion_scale,
+                target_indices=[1, 2],
+            )
+        elif skip_fusion == "sdi_resprod":
+            self.skip_fusion = SDIFusion(
+                skip_dims,
+                inter_channels=sdi_channels,
+                target_levels=3,
+                init_scale=skip_fusion_scale,
+                fusion_mode="resprod",
+            )
+        elif skip_fusion == "sdi_gate":
+            self.skip_fusion = SDIFusion(
+                skip_dims,
+                inter_channels=sdi_channels,
+                target_levels=3,
+                init_scale=skip_fusion_scale,
+                use_gate=True,
             )
         elif skip_fusion == "sdi_add":
             self.skip_fusion = SDIFusion(
@@ -708,7 +1013,10 @@ class CSWinTransformer(nn.Module):
             else:
                 x = blk(x)
         x = self.upsample4(x)
-        x = torch.cat([self.x3, x],-1)
+        skip = self.x3
+        if self.decoder_skip_gates is not None:
+            skip = self.decoder_skip_gates[0](skip, x)
+        x = torch.cat([skip, x],-1)
         x = self.concat_linear4(x)
         for blk in self.stage_up3:
             if self.use_chk:
@@ -717,7 +1025,10 @@ class CSWinTransformer(nn.Module):
                 x = blk(x)
         # print("decoder stage3", x.shape)
         x = self.upsample3(x)
-        x = torch.cat([self.x2, x],-1)
+        skip = self.x2
+        if self.decoder_skip_gates is not None:
+            skip = self.decoder_skip_gates[1](skip, x)
+        x = torch.cat([skip, x],-1)
         x = self.concat_linear3(x)
         for blk in self.stage_up2:
             if self.use_chk:
@@ -725,7 +1036,10 @@ class CSWinTransformer(nn.Module):
             else:
                     x = blk(x)
         x = self.upsample2(x)
-        x = torch.cat([self.x1, x],-1)
+        skip = self.x1
+        if self.decoder_skip_gates is not None:
+            skip = self.decoder_skip_gates[2](skip, x)
+        x = torch.cat([skip, x],-1)
         x = self.concat_linear2(x)
         for blk in self.stage_up1:
             if self.use_chk:
@@ -754,4 +1068,3 @@ class CSWinTransformer(nn.Module):
 
 
         return x
-

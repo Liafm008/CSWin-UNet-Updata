@@ -134,7 +134,18 @@ parser.add_argument(
     "--skip_fusion",
     type=str,
     default="none",
-    choices=["none", "attention", "sdi", "sdi_add"],
+    choices=[
+        "none",
+        "attention",
+        "decoder_gate",
+        "sab_cab",
+        "dca",
+        "sdi",
+        "sdi_mid",
+        "sdi_resprod",
+        "sdi_gate",
+        "sdi_add",
+    ],
     help="skip connection refinement used by the trained checkpoint",
 )
 parser.add_argument(
